@@ -5,9 +5,11 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
+import glob
 import json
 import logging
 import os
+import pickle
 
 import numpy as np
 import torch
@@ -74,22 +76,73 @@ def parse_args(args=None):
     
     return parser.parse_args(args)
 
+def training_output_path(prefix, args):
+    return f'{prefix}_hp: {args.hp}_rp: {args.rp}_r_weight: {args.r_weight}'
+
+
+def resolve_checkpoint_dir(path):
+    if os.path.isdir(path):
+        return path
+
+    # run.sh knows the run prefix, while training appends hyperparameters.
+    prefix = glob.escape(os.path.normpath(path))
+    candidates = sorted(
+        directory for directory in glob.glob(prefix + '_hp: *_rp: *_r_weight: *')
+        if os.path.isdir(directory)
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise ValueError(f'Multiple checkpoint directories match {path!r}: {candidates}. '
+                         'Pass the exact directory with --init_checkpoint.')
+    raise FileNotFoundError(f'No checkpoint directory found at {path!r} or matching its training suffix.')
+
+
 def override_config(args):
     '''
     Override model and data configuration
     '''
     
-    with open(os.path.join(args.init_checkpoint, 'config.json'), 'r') as fjson:
-        argparse_dict = json.load(fjson)
-    
-    args.countries = argparse_dict['countries']
-    if args.data_path is None:
-        args.data_path = argparse_dict['data_path']
-    args.model = argparse_dict['model']
-    args.double_entity_embedding = argparse_dict['double_entity_embedding']
-    args.double_relation_embedding = argparse_dict['double_relation_embedding']
-    args.hidden_dim = argparse_dict['hidden_dim']
-    args.test_batch_size = argparse_dict['test_batch_size']
+    config_path = os.path.join(args.init_checkpoint, 'config.json')
+    try:
+        with open(config_path, 'r') as fjson:
+            config = json.load(fjson)
+        for key in ('countries', 'model', 'double_entity_embedding',
+                    'double_relation_embedding', 'hidden_dim', 'test_batch_size'):
+            setattr(args, key, config[key])
+        if args.data_path is None:
+            args.data_path = config['data_path']
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f'Invalid checkpoint configuration {config_path!r}: {exc}') from exc
+
+    # Older configurations may predate these options.
+    for key in ('gamma', 'Linear_2', 'hp', 'rp', 'r_weight'):
+        if key in config:
+            setattr(args, key, config[key])
+
+
+def load_checkpoint(args):
+    flat_path = os.path.join(args.init_checkpoint, 'checkpoint')
+    nested_path = os.path.join(flat_path, 'checkpoint')
+    path = nested_path if os.path.isfile(nested_path) else flat_path
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'Checkpoint payload not found. Looked for {nested_path!r} and {flat_path!r}.')
+
+    try:
+        checkpoint = torch.load(path, map_location='cpu')
+    except (OSError, EOFError, RuntimeError, ValueError, TypeError, pickle.UnpicklingError) as exc:
+        raise ValueError(f'Could not load checkpoint {path!r}: {exc}') from exc
+    required = {'step', 'model_state_dict'}
+    if args.do_train:
+        required.update(('current_learning_rate', 'warm_up_steps', 'optimizer_state_dict'))
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f'Invalid checkpoint {path!r}: expected a dictionary.')
+    missing = required.difference(checkpoint)
+    if missing:
+        raise ValueError(f'Invalid checkpoint {path!r}: missing {", ".join(sorted(missing))}.')
+    if not isinstance(checkpoint['step'], (int, np.integer)):
+        raise ValueError(f'Invalid checkpoint {path!r}: step must be an integer.')
+    return checkpoint
     
 def save_model(model, optimizer, save_variable_list, args):
     '''
@@ -97,6 +150,8 @@ def save_model(model, optimizer, save_variable_list, args):
     as well as some other variables such as step and learning_rate
     '''
     
+    checkpoint_dir = os.path.join(args.save_path, 'checkpoint')
+    os.makedirs(checkpoint_dir, exist_ok=True)
     argparse_dict = vars(args)
     with open(os.path.join(args.save_path, 'config.json'), 'w') as fjson:
         json.dump(argparse_dict, fjson)
@@ -105,7 +160,7 @@ def save_model(model, optimizer, save_variable_list, args):
         **save_variable_list,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict()},
-        os.path.join(args.save_path, 'checkpoint', 'checkpoint')
+        os.path.join(checkpoint_dir, 'checkpoint')
     )
     
     entity_embedding = model.entity_embedding.detach().cpu().numpy()
@@ -136,10 +191,8 @@ def set_logger(args):
     Write logs to checkpoint and console
     '''
 
-    if args.do_train:
-        log_file = os.path.join(args.save_path or args.init_checkpoint, 'train.log')
-    else:
-        log_file = os.path.join(args.save_path or args.init_checkpoint, 'test.log')
+    log_dir = args.save_path or args.init_checkpoint
+    log_file = os.path.join(log_dir, 'train.log' if args.do_train else 'test.log') if log_dir else None
 
     logging.basicConfig(
         format='%(asctime)s %(levelname)-8s %(message)s',
@@ -164,22 +217,22 @@ def log_metrics(mode, step, metrics):
         
 def main(args):
     
-    args.save_path = os.path.join(args.save_path + '_hp: ' + str(args.hp) + '_rp: ' + str(args.rp) + '_r_weight: ' + str(args.r_weight))
-    
     if (not args.do_train) and (not args.do_valid) and (not args.do_test):
         raise ValueError('one of train/val/test mode must be choosed.')
     
     if args.init_checkpoint:
+        args.init_checkpoint = resolve_checkpoint_dir(args.init_checkpoint)
         override_config(args)
     elif args.data_path is None:
         raise ValueError('one of init_checkpoint/data_path must be choosed.')
 
-    if args.do_train and args.save_path is None:
-        raise ValueError('Where do you want to save your trained model?')
-    
-    if args.save_path and not os.path.exists(args.save_path):
-        os.makedirs(args.save_path)
-        os.makedirs(args.save_path + '/checkpoint')
+    if args.do_train:
+        if args.save_path is None:
+            raise ValueError('Where do you want to save your trained model?')
+        args.save_path = training_output_path(args.save_path, args)
+
+    if args.save_path:
+        os.makedirs(args.save_path, exist_ok=True)
     
     # Write logs to checkpoint and console
     set_logger(args)
@@ -278,7 +331,7 @@ def main(args):
     if args.init_checkpoint:
         # Restore model from checkpoint directory
         logging.info('Loading checkpoint %s...' % args.init_checkpoint)
-        checkpoint = torch.load(os.path.join(args.init_checkpoint, 'checkpoint'))
+        checkpoint = load_checkpoint(args)
         init_step = checkpoint['step']
         kge_model.load_state_dict(checkpoint['model_state_dict'])
         if args.do_train:
